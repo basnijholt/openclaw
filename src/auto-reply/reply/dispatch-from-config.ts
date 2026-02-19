@@ -3,7 +3,12 @@ import type { OpenClawConfig } from "../../config/config.js";
 import { loadSessionStore, resolveStorePath, type SessionEntry } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { fireAndForgetHook } from "../../hooks/fire-and-forget.js";
-import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
+import {
+  createInternalHookEvent,
+  hasEnrichHooks,
+  triggerEnrichHook,
+  triggerInternalHook,
+} from "../../hooks/internal-hooks.js";
 import {
   deriveInboundMessageHookContext,
   toInternalMessageReceivedContext,
@@ -175,7 +180,7 @@ export async function dispatchReplyFromConfig(params: {
   const messageIdForHook =
     ctx.MessageSidFull ?? ctx.MessageSid ?? ctx.MessageSidFirst ?? ctx.MessageSidLast;
   const hookContext = deriveInboundMessageHookContext(ctx, { messageId: messageIdForHook });
-  const { isGroup, groupId } = hookContext;
+  const { isGroup, groupId, content, channelId, conversationId } = hookContext;
 
   // Trigger plugin hooks (fire-and-forget)
   if (hookRunner?.hasHooks("message_received")) {
@@ -199,6 +204,52 @@ export async function dispatchReplyFromConfig(params: {
       ),
       "dispatch-from-config: message_received internal hook failed",
     );
+  }
+
+  // Trigger message:enrich hooks (synchronous, awaited) to inject custom metadata
+  // into the per-message context before the agent run. Unlike message:received (fire-and-forget),
+  // enrich hooks can return metadata that gets merged into UntrustedContext.
+  if (sessionKey && hasEnrichHooks()) {
+    try {
+      const enrichEvent = createInternalHookEvent("message", "enrich", sessionKey, {
+        from: ctx.From ?? "",
+        content,
+        timestamp,
+        channelId,
+        accountId: ctx.AccountId,
+        conversationId,
+        messageId: messageIdForHook,
+        sessionKey,
+        metadata: {
+          to: ctx.To,
+          provider: ctx.Provider,
+          surface: ctx.Surface,
+          threadId: ctx.MessageThreadId,
+          senderId: ctx.SenderId,
+          senderName: ctx.SenderName,
+          senderUsername: ctx.SenderUsername,
+          senderE164: ctx.SenderE164,
+        },
+      });
+      const enrichedMetadata = await triggerEnrichHook(enrichEvent);
+      if (Object.keys(enrichedMetadata).length > 0) {
+        const enrichBlock = [
+          "Enriched context (hook-injected metadata):",
+          "```json",
+          JSON.stringify(enrichedMetadata, null, 2),
+          "```",
+        ].join("\n");
+        if (!ctx.UntrustedContext) {
+          ctx.UntrustedContext = [];
+        }
+        ctx.UntrustedContext.push(enrichBlock);
+        logVerbose(
+          `dispatch-from-config: message:enrich injected ${Object.keys(enrichedMetadata).length} metadata key(s)`,
+        );
+      }
+    } catch (err) {
+      logVerbose(`dispatch-from-config: message:enrich hook failed: ${String(err)}`);
+    }
   }
 
   // Check if we should route replies to originating channel instead of dispatcher.

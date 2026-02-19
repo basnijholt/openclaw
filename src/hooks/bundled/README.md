@@ -170,8 +170,10 @@ Currently supported events:
 - **command:stop**: `/stop` command
 - **agent:bootstrap**: Before workspace bootstrap files are injected
 - **gateway:startup**: Gateway startup (after channels start)
-
-More event types coming soon (session lifecycle, agent errors, etc.).
+- **message**: All message events
+- **message:received**: When an inbound message arrives (observational, fire-and-forget)
+- **message:sent**: When an outbound message is sent (observational, fire-and-forget)
+- **message:enrich**: Inject custom metadata into inbound messages before the agent sees them (see below)
 
 ## Handler API
 
@@ -179,8 +181,8 @@ Hook handlers receive an `InternalHookEvent` object:
 
 ```typescript
 interface InternalHookEvent {
-  type: "command" | "session" | "agent" | "gateway";
-  action: string; // e.g., 'new', 'reset', 'stop'
+  type: "command" | "session" | "agent" | "gateway" | "message";
+  action: string; // e.g., 'new', 'reset', 'stop', 'received', 'enrich'
   sessionKey: string;
   context: Record<string, unknown>;
   timestamp: Date;
@@ -207,6 +209,96 @@ const myHandler: HookHandler = async (event) => {
 
 export default myHandler;
 ```
+
+## Enrichment Hooks (`message:enrich`)
+
+Enrichment hooks inject custom per-message metadata into the agent's context **without modifying the system prompt** (preserving prompt cache). This is useful for context-aware behavior like:
+
+- Injecting GPS location/velocity so the agent can reply with voice when the user is driving
+- Adding calendar availability or device state
+- Attaching external sensor data or API results
+
+Unlike regular hooks (fire-and-forget), enrichment handlers **return metadata** that gets merged into the per-message `UntrustedContext` block — the same place conversation info, sender info, and reply context live.
+
+### How it works
+
+1. An inbound message arrives
+2. `message:received` fires (observational, as before)
+3. `message:enrich` fires — handlers can return `{ metadata: Record<string, unknown> }`
+4. Returned metadata is merged and appended to `UntrustedContext`
+5. The agent sees the enriched context alongside conversation info
+
+Zero overhead when no enrich hooks are registered (`hasEnrichHooks()` guard skips the entire path).
+
+### Why not system prompt injection?
+
+Workspace context files (AGENTS.md, TOOLS.md, etc.) are injected into the **system prompt**, which is cached across messages. Writing dynamic data there (e.g., current velocity) would change the system prompt on every message, breaking the cache. With models like Opus at $5/MTok input, this gets expensive fast.
+
+Enrichment hooks inject into **user-role context** instead, so the system prompt stays stable and cacheable.
+
+### Example: enrichment hook handler
+
+```typescript
+// handler.ts
+import type { EnrichHookHandler } from "../../src/hooks/hooks.js";
+
+const handler: EnrichHookHandler = async (event) => {
+  // Call any external API, read a file, etc.
+  const resp = await fetch("https://my-api.example.com/context");
+  const data = await resp.json();
+
+  return {
+    metadata: {
+      velocity_mps: data.velocity,
+      latitude: data.lat,
+      longitude: data.lon,
+      source: "my-tracker",
+    },
+  };
+};
+
+export default handler;
+```
+
+```yaml
+# HOOK.md
+---
+name: my-enrich-hook
+description: "Inject custom context into inbound messages"
+metadata:
+  { "openclaw": { "emoji": "📍", "events": ["message:enrich"] } }
+---
+```
+
+The agent will see this as an enriched context block in its prompt:
+
+```
+Enriched context (hook-injected metadata):
+{
+  "velocity_mps": 12.5,
+  "latitude": 47.70,
+  "longitude": -122.20,
+  "source": "my-tracker"
+}
+```
+
+### Configuration
+
+Enable an enrichment hook in `openclaw.json`:
+
+```json
+{
+  "hooks": {
+    "internal": {
+      "entries": {
+        "my-enrich-hook": { "enabled": true }
+      }
+    }
+  }
+}
+```
+
+Place the hook in `~/.openclaw/hooks/my-enrich-hook/` or `<workspace>/hooks/my-enrich-hook/`.
 
 ## Testing
 

@@ -12,6 +12,27 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 
 export type InternalHookEventType = "command" | "session" | "agent" | "gateway" | "message";
 
+// ============================================================================
+// Enrichment Hook Types
+// ============================================================================
+
+/**
+ * Result returned by a message:enrich handler.
+ * The `metadata` record is merged into the per-message untrusted context
+ * so the agent can see it without breaking system-prompt caching.
+ */
+export type MessageEnrichResult = {
+  metadata?: Record<string, unknown>;
+};
+
+/**
+ * Handler type for enrichment hooks that can return metadata to inject.
+ * Returning void/undefined means the handler has nothing to contribute.
+ */
+export type InternalEnrichHookHandler = (
+  event: InternalHookEvent,
+) => Promise<MessageEnrichResult | void> | MessageEnrichResult | void;
+
 export type AgentBootstrapHookContext = {
   workspaceDir: string;
   bootstrapFiles: WorkspaceBootstrapFile[];
@@ -66,6 +87,33 @@ export type MessageReceivedHookEvent = InternalHookEvent & {
   type: "message";
   action: "received";
   context: MessageReceivedHookContext;
+};
+
+export type MessageEnrichHookContext = {
+  /** Sender identifier (e.g., phone number, user ID) */
+  from: string;
+  /** Message content */
+  content: string;
+  /** Unix timestamp when the message was received */
+  timestamp?: number;
+  /** Channel identifier (e.g., "telegram", "whatsapp") */
+  channelId: string;
+  /** Provider account ID for multi-account setups */
+  accountId?: string;
+  /** Conversation/chat ID */
+  conversationId?: string;
+  /** Message ID from the provider */
+  messageId?: string;
+  /** Session key for this message */
+  sessionKey: string;
+  /** Additional provider-specific metadata */
+  metadata?: Record<string, unknown>;
+};
+
+export type MessageEnrichHookEvent = InternalHookEvent & {
+  type: "message";
+  action: "enrich";
+  context: MessageEnrichHookContext;
 };
 
 export type MessageSentHookContext = {
@@ -219,6 +267,9 @@ const handlers = (_g.__openclaw_internal_hook_handlers__ ??= new Map<
 >());
 const log = createSubsystemLogger("internal-hooks");
 
+/** Registry of enrichment hook handlers (message:enrich) by event key */
+const enrichHandlers = new Map<string, InternalEnrichHookHandler[]>();
+
 /**
  * Register a hook handler for a specific event type or event:action combination
  *
@@ -243,6 +294,60 @@ export function registerInternalHook(eventKey: string, handler: InternalHookHand
     handlers.set(eventKey, []);
   }
   handlers.get(eventKey)!.push(handler);
+}
+
+/**
+ * Register an enrichment hook handler for a specific event key.
+ *
+ * Enrichment handlers can return `{ metadata: Record<string, unknown> }` which
+ * gets merged into the per-message untrusted context block that the agent sees.
+ *
+ * @param eventKey - Event key (typically "message:enrich")
+ * @param handler - Function that may return metadata to inject
+ *
+ * @example
+ * ```ts
+ * registerInternalEnrichHook('message:enrich', async (event) => {
+ *   const location = await fetchCurrentLocation();
+ *   return {
+ *     metadata: {
+ *       latitude: location.lat,
+ *       longitude: location.lon,
+ *       velocity_mps: location.velocity,
+ *       source: 'dawarich',
+ *     },
+ *   };
+ * });
+ * ```
+ */
+export function registerInternalEnrichHook(
+  eventKey: string,
+  handler: InternalEnrichHookHandler,
+): void {
+  if (!enrichHandlers.has(eventKey)) {
+    enrichHandlers.set(eventKey, []);
+  }
+  enrichHandlers.get(eventKey)!.push(handler);
+}
+
+/**
+ * Unregister an enrichment hook handler
+ */
+export function unregisterInternalEnrichHook(
+  eventKey: string,
+  handler: InternalEnrichHookHandler,
+): void {
+  const eventEnrichHandlers = enrichHandlers.get(eventKey);
+  if (!eventEnrichHandlers) {
+    return;
+  }
+  const index = eventEnrichHandlers.indexOf(handler);
+  if (index !== -1) {
+    eventEnrichHandlers.splice(index, 1);
+  }
+  if (eventEnrichHandlers.length === 0) {
+    enrichHandlers.delete(eventKey);
+  }
 }
 
 /**
@@ -273,13 +378,15 @@ export function unregisterInternalHook(eventKey: string, handler: InternalHookHa
  */
 export function clearInternalHooks(): void {
   handlers.clear();
+  enrichHandlers.clear();
 }
 
 /**
  * Get all registered event keys (useful for debugging)
  */
 export function getRegisteredEventKeys(): string[] {
-  return Array.from(handlers.keys());
+  const keys = new Set([...handlers.keys(), ...enrichHandlers.keys()]);
+  return Array.from(keys);
 }
 
 /**
@@ -312,6 +419,56 @@ export async function triggerInternalHook(event: InternalHookEvent): Promise<voi
       log.error(`Hook error [${event.type}:${event.action}]: ${message}`);
     }
   }
+}
+
+/**
+ * Trigger enrichment hooks and collect metadata from all handlers.
+ *
+ * Unlike `triggerInternalHook` (fire-and-forget), this function awaits all
+ * handlers and merges their returned `{ metadata }` into a single record.
+ * Later handlers overwrite earlier ones on key conflicts.
+ *
+ * Returns the merged metadata record, or an empty object if no handlers
+ * contributed metadata.
+ *
+ * @param event - The event to trigger (typically message:enrich)
+ */
+export async function triggerEnrichHook(
+  event: InternalHookEvent,
+): Promise<Record<string, unknown>> {
+  const typeHandlers = enrichHandlers.get(event.type) ?? [];
+  const specificHandlers = enrichHandlers.get(`${event.type}:${event.action}`) ?? [];
+  const allHandlers = [...typeHandlers, ...specificHandlers];
+
+  if (allHandlers.length === 0) {
+    return {};
+  }
+
+  const merged: Record<string, unknown> = {};
+
+  for (const handler of allHandlers) {
+    try {
+      const result = await handler(event);
+      if (result?.metadata) {
+        Object.assign(merged, result.metadata);
+      }
+    } catch (err) {
+      console.error(
+        `Enrich hook error [${event.type}:${event.action}]:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Check whether any enrichment handlers are registered for message:enrich
+ */
+export function hasEnrichHooks(): boolean {
+  return (enrichHandlers.get("message") ?? []).length > 0 ||
+    (enrichHandlers.get("message:enrich") ?? []).length > 0;
 }
 
 /**
@@ -402,6 +559,19 @@ export function isMessageReceivedEvent(
     return false;
   }
   return hasStringContextField(context, "from") && hasStringContextField(context, "channelId");
+}
+
+export function isMessageEnrichEvent(
+  event: InternalHookEvent,
+): event is MessageEnrichHookEvent {
+  if (event.type !== "message" || event.action !== "enrich") {
+    return false;
+  }
+  const context = event.context as Partial<MessageEnrichHookContext> | null;
+  if (!context || typeof context !== "object") {
+    return false;
+  }
+  return typeof context.from === "string" && typeof context.channelId === "string";
 }
 
 export function isMessageSentEvent(event: InternalHookEvent): event is MessageSentHookEvent {
